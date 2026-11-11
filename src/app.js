@@ -12,6 +12,10 @@ import { createOrdersRouter } from './ordersRouter.js';
 // isReferenced defaults to "yes, in use" so a missing wiring can never delete an image.
 export function createApp({ verifyToken, imageStore, membership, logger, sales, purchases, expenses, pdf, orders, notifier, isReferenced = async () => true }) {
   const app = express();
+  // Behind a hosting proxy (Render puts exactly one in front) every request arrives from the proxy's address.
+  // Trusting one hop makes req.ip the real client, so the rate limiters count each client separately instead of
+  // lumping everybody together, and express-rate-limit stops reporting ERR_ERL_UNEXPECTED_X_FORWARDED_FOR.
+  app.set('trust proxy', Number(process.env.TRUST_PROXY_HOPS ?? 1));
   app.disable('x-powered-by');
   app.use(helmet());
   app.use(express.json({ limit: '64kb' })); // a 50-line cart is ~5 KB
