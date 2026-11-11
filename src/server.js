@@ -11,6 +11,9 @@ import { createExpensesService } from './expenses.js';
 import { createPdfDataService } from './pdf/data.js';
 import { createPdfRenderer } from './pdf/render.js';
 import { createPdfService } from './pdf/service.js';
+import { getMessaging } from 'firebase-admin/messaging';
+import { createOrdersService } from './orders.js';
+import { createNotifier } from './notifications.js';
 import { createApp } from './app.js';
 
 const logger = pino();
@@ -24,12 +27,21 @@ const pdf = createPdfService({
   fonts: { regular: cfg.PDF_FONT_REGULAR, bold: cfg.PDF_FONT_BOLD },
   logger,
 });
+// Orders need the sales service (planSale); sales/purchases call back into orders when stock changes.
+// The callback is fire-and-forget so a slow availability check never delays a sale or purchase.
+const notifier = createNotifier({ db, messaging: getMessaging(), logger });
+let orders;
+const onStockChanged = (ids) => { orders?.checkProducts(ids).catch((err) => logger.error({ err }, 'availability check failed')); };
+const sales = createSalesService({ db, fieldValue: FieldValue, onStockChanged });
+orders = createOrdersService({ db, fieldValue: FieldValue, sales, notifier, logger });
 const app = createApp({
   verifyToken: createTokenVerifier(auth),
   imageStore,
   membership: createMembershipService({ db, auth }),
-  sales: createSalesService({ db, fieldValue: FieldValue }),
-  purchases: createPurchasesService({ db, fieldValue: FieldValue }),
+  sales,
+  purchases: createPurchasesService({ db, fieldValue: FieldValue, onStockChanged }),
+  orders,
+  notifier,
   expenses: createExpensesService({ db, fieldValue: FieldValue }),
   pdf,
   isReferenced: createReferenceChecker(db),

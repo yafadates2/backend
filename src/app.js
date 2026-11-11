@@ -7,9 +7,10 @@ import { createSalesRouter } from './salesRouter.js';
 import { createPurchasesRouter } from './purchasesRouter.js';
 import { createExpensesRouter } from './expensesRouter.js';
 import { createPdfRouter } from './pdf/router.js';
+import { createOrdersRouter } from './ordersRouter.js';
 
 // isReferenced defaults to "yes, in use" so a missing wiring can never delete an image.
-export function createApp({ verifyToken, imageStore, membership, logger, sales, purchases, expenses, pdf, isReferenced = async () => true }) {
+export function createApp({ verifyToken, imageStore, membership, logger, sales, purchases, expenses, pdf, orders, notifier, isReferenced = async () => true }) {
   const app = express();
   app.disable('x-powered-by');
   app.use(helmet());
@@ -72,6 +73,12 @@ export function createApp({ verifyToken, imageStore, membership, logger, sales, 
   if (expenses) {
     const expensesLimiter = rateLimit({ windowMs: 60_000, limit: 120, standardHeaders: true, legacyHeaders: false });
     app.use(createExpensesRouter({ expenses, logger, guards: [requireAuth, requireMember, expensesLimiter] }));
+  }
+
+  // Customer orders (requests recorded by the admin; stock moves only when one is completed) and push-device registration.
+  if (orders && notifier) {
+    const ordersLimiter = rateLimit({ windowMs: 60_000, limit: 120, standardHeaders: true, legacyHeaders: false });
+    app.use(createOrdersRouter({ orders, notifier, logger, guards: [requireAuth, requireMember, ordersLimiter] }));
   }
 
   // PDF documents (bills, receipts, statements, reports): read-only GETs; Chromium is heavy, so a tighter limit.

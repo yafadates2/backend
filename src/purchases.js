@@ -9,7 +9,7 @@ import { computePurchaseTotals, avgAfterReceive, avgAfterRemoval } from './purch
  * Idempotency: the document id is chosen by the app once per action. Same id + same content = stored result
  * (`duplicate: true`); same id + other content = `idempotency_conflict`.
  */
-export function createPurchasesService({ db, fieldValue, now = () => Date.now() }) {
+export function createPurchasesService({ db, fieldValue, now = () => Date.now(), onStockChanged = async () => {} }) {
   const settingsRef = db.collection('shop_settings').doc('main');
   const counterRef = (name) => db.collection('counters').doc(name);
   const statsRef = (date) => db.collection('daily_stats').doc(date);
@@ -20,6 +20,10 @@ export function createPurchasesService({ db, fieldValue, now = () => Date.now() 
   const ts = () => fieldValue.serverTimestamp();
   const int = (v) => (Number.isSafeInteger(v) ? v : 0);
   const nn = (i) => String(i + 1).padStart(3, '0');
+  // Stock changed: customer orders re-check availability. Best effort, never fails the purchase.
+  const stockChanged = async (ids) => {
+    try { await onStockChanged(ids); } catch { /* the next availability check catches up */ }
+  };
 
   return {
     /** input: {purchaseId, supplierId, invoiceRef, businessDate, lines:[{productId, qty, unitCost}], discount, extraCosts, cashPaid, note} */
@@ -37,7 +41,7 @@ export function createPurchasesService({ db, fieldValue, now = () => Date.now() 
       });
       const purchaseRef = db.collection('purchases').doc(purchaseId);
 
-      return db.runTransaction(async (tx) => {
+      const out = await db.runTransaction(async (tx) => {
         const snaps = await tx.getAll(purchaseRef, settingsRef, counterRef('purchases'), supplierRef(supplierId), ...ids.map(productRef));
         const [purchaseSnap, settingsSnap, counterSnap, supplierSnap] = snaps;
         const productSnaps = snaps.slice(4);
@@ -105,6 +109,8 @@ export function createPurchasesService({ db, fieldValue, now = () => Date.now() 
 
         return { id: purchaseId, number, total, remaining: credit, status: 'active', duplicate: false };
       });
+      if (!out.duplicate) await stockChanged(ids);
+      return out;
     },
 
     /**
@@ -118,7 +124,8 @@ export function createPurchasesService({ db, fieldValue, now = () => Date.now() 
       const purchaseRef = db.collection('purchases').doc(purchaseId);
       const voidRef = db.collection('purchase_voids').doc(purchaseId);
 
-      return db.runTransaction(async (tx) => {
+      let touched = [];
+      const out = await db.runTransaction(async (tx) => {
         const [purchaseSnap, voidSnap] = await tx.getAll(purchaseRef, voidRef);
         if (!purchaseSnap.exists) throw new SalesError('purchase_not_found', 404);
         if (voidSnap.exists || purchaseSnap.get('status') === 'voided') {
@@ -126,6 +133,7 @@ export function createPurchasesService({ db, fieldValue, now = () => Date.now() 
         }
         const itemsSnap = await tx.get(purchaseRef.collection('purchase_items'));
         const items = itemsSnap.docs.map((d) => ({ n: d.id, ...d.data() }));
+        touched = items.map((it) => it.productId);
         const supplierId = purchaseSnap.get('supplierId');
         const refs = [
           ...items.map((it) => productRef(it.productId)),
@@ -181,6 +189,8 @@ export function createPurchasesService({ db, fieldValue, now = () => Date.now() 
 
         return { id: purchaseId, status: 'voided', duplicate: false };
       });
+      if (!out.duplicate) await stockChanged(touched);
+      return out;
     },
 
     /** The shop pays a supplier: settles the oldest open purchases first (FIFO). */

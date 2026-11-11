@@ -16,6 +16,9 @@ function applyValue(prev, key, v) {
 
 export function createFakeDb() {
   const store = new Map(); // path -> data
+  const versions = new Map(); // path -> commit counter, for optimistic concurrency like real Firestore
+  const ver = (p) => versions.get(p) ?? 0;
+  const bump = (p) => versions.set(p, ver(p) + 1);
   let tick = 0;
 
   const snap = (path) => {
@@ -33,6 +36,8 @@ export function createFakeDb() {
     id: path.split('/').pop(),
     collection: (name) => colRef(`${path}/${name}`),
     get: async () => snap(path), // read-only services (PDF) use ref.get()
+    set: async (data) => { store.set(path, { ...clone(data) }); bump(path); },
+    delete: async () => { store.delete(path); bump(path); },
   });
 
   function colRef(path, filters = [], order = null, max = null) {
@@ -40,7 +45,7 @@ export function createFakeDb() {
       path,
       doc: (id) => docRef(`${path}/${id}`),
       where: (f, op, v) => {
-        if (!['==', '>=', '<=', '>', '<'].includes(op)) throw new Error(`fake does not support ${op}`);
+        if (!['==', '>=', '<=', '>', '<', 'array-contains-any'].includes(op)) throw new Error(`fake does not support ${op}`);
         return colRef(path, [...filters, [f, v, op]], order, max);
       },
       orderBy: (f, dir = 'asc') => colRef(path, filters, [f, dir], max),
@@ -54,7 +59,7 @@ export function createFakeDb() {
         let docs = [...store.entries()]
           .filter(([p]) => p.startsWith(prefix) && !p.slice(prefix.length).includes('/'))
           .filter(([, d]) => filters.every(([f, v, op = '==']) => (
-            op === '==' ? d[f] === v : op === '>=' ? d[f] >= v : op === '<=' ? d[f] <= v : op === '>' ? d[f] > v : d[f] < v)))
+            op === 'array-contains-any' ? Array.isArray(d[f]) && d[f].some((x) => v.includes(x)) : op === '==' ? d[f] === v : op === '>=' ? d[f] >= v : op === '<=' ? d[f] <= v : op === '>' ? d[f] > v : d[f] < v)))
           .map(([p, d]) => ({ p, d }));
         if (order) {
           const [f, dir] = order;
@@ -83,37 +88,52 @@ export function createFakeDb() {
     },
     get: (path) => clone(store.get(path)),
     async runTransaction(fn) {
-      const writes = [];
-      let wrote = false;
-      const tx = {
-        getAll: async (...refs) => {
-          if (wrote) throw new Error('read after write in transaction');
-          return refs.map((r) => snap(r.path));
-        },
-        get: async (target) => {
-          if (wrote) throw new Error('read after write in transaction');
-          return target.__run ? target.__run() : snap(target.path);
-        },
-        create: (ref, data) => { wrote = true; writes.push(['create', ref.path, data]); },
-        set: (ref, data, opts) => { wrote = true; writes.push(['set', ref.path, data, opts]); },
-        update: (ref, data) => { wrote = true; writes.push(['update', ref.path, data]); },
-      };
-      const result = await fn(tx);
-      // commit: validate everything first so a failure leaves the store untouched
-      const next = new Map(store);
-      for (const [op, path, data, opts] of writes) {
-        const prev = next.get(path);
-        if (op === 'create' && prev !== undefined) throw new Error(`ALREADY_EXISTS ${path}`);
-        if (op === 'update' && prev === undefined) throw new Error(`NOT_FOUND ${path}`);
-        const base = op === 'create' || (op === 'set' && !opts?.merge) ? {} : { ...prev };
-        const out = { ...base };
-        for (const [k, v] of Object.entries(data)) out[k] = applyValue(prev, k, v);
-        if (out.createdAt instanceof Date) out.createdAt = ++tick; // monotonic stand-in for server time
-        next.set(path, out);
+      // Real Firestore retries a transaction whose reads changed before it committed: same here.
+      for (let attempt = 0; attempt < 6; attempt += 1) {
+        const writes = [];
+        const reads = new Map(); // path -> version seen
+        let wrote = false;
+        const seen = (path) => { if (!reads.has(path)) reads.set(path, ver(path)); };
+        const tx = {
+          getAll: async (...refs) => {
+            if (wrote) throw new Error('read after write in transaction');
+            refs.forEach((r) => seen(r.path));
+            return refs.map((r) => snap(r.path));
+          },
+          get: async (target) => {
+            if (wrote) throw new Error('read after write in transaction');
+            if (target.__run) {
+              const out = target.__run();
+              out.docs.forEach((d) => seen(`${target.path}/${d.id}`));
+              return out;
+            }
+            seen(target.path);
+            return snap(target.path);
+          },
+          create: (ref, data) => { wrote = true; writes.push(['create', ref.path, data]); },
+          set: (ref, data, opts) => { wrote = true; writes.push(['set', ref.path, data, opts]); },
+          update: (ref, data) => { wrote = true; writes.push(['update', ref.path, data]); },
+        };
+        const result = await fn(tx);
+        if ([...reads].some(([p, v]) => ver(p) !== v)) continue; // someone committed in between: run again
+        // commit: validate everything first so a failure leaves the store untouched
+        const next = new Map(store);
+        for (const [op, path, data, opts] of writes) {
+          const prev = next.get(path);
+          if (op === 'create' && prev !== undefined) throw new Error(`ALREADY_EXISTS ${path}`);
+          if (op === 'update' && prev === undefined) throw new Error(`NOT_FOUND ${path}`);
+          const base = op === 'create' || (op === 'set' && !opts?.merge) ? {} : { ...prev };
+          const out = { ...base };
+          for (const [k, v] of Object.entries(data)) out[k] = applyValue(prev, k, v);
+          if (out.createdAt instanceof Date) out.createdAt = ++tick; // monotonic stand-in for server time
+          next.set(path, out);
+        }
+        store.clear();
+        for (const [k, v] of next) store.set(k, v);
+        for (const [, path] of writes) bump(path);
+        return result;
       }
-      store.clear();
-      for (const [k, v] of next) store.set(k, v);
-      return result;
+      throw new Error('transaction kept conflicting');
     },
   };
   return db;

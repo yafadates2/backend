@@ -13,7 +13,7 @@ import {
  *
  * `fieldValue` is firebase-admin's FieldValue (injected so tests can run on an in-memory Firestore).
  */
-export function createSalesService({ db, fieldValue, now = () => Date.now() }) {
+export function createSalesService({ db, fieldValue, now = () => Date.now(), onStockChanged = async () => {} }) {
   const settingsRef = db.collection('shop_settings').doc('main');
   const counterRef = (name) => db.collection('counters').doc(name);
   const statsRef = (date) => db.collection('daily_stats').doc(date);
@@ -32,107 +32,131 @@ export function createSalesService({ db, fieldValue, now = () => Date.now() }) {
     duplicate,
   });
 
+  // Stock changed: let customer orders re-check availability. Never allowed to fail the sale itself.
+  const stockChanged = async (ids) => {
+    try { await onStockChanged(ids); } catch { /* best effort: the next check catches up */ }
+  };
+
+  /**
+   * Phase 1 of a sale, inside a caller-owned transaction: ALL reads + validation, no writes.
+   * Returns { result, duplicate, commit }; `commit()` performs the writes (call it after every read of the
+   * transaction is done). createSale uses it directly; customer-order completion calls it in the same
+   * transaction as the order's own status change, so a sale and its order can never diverge.
+   */
+  async function planSale(tx, uid, input) {
+    const { saleId, businessDate, lines, discount, cashPaid, note } = input;
+    const clientId = input.clientId ?? null;
+    assertBusinessDate(businessDate, now());
+    if (lines.length < 1 || lines.length > MAX_LINES) throw new SalesError('invalid_request', 400);
+    const ids = lines.map((l) => l.productId);
+    if (new Set(ids).size !== ids.length) throw new SalesError('duplicate_product', 400);
+    const fp = fingerprint({
+      clientId, businessDate, discount, cashPaid, note,
+      lines: lines.map((l) => ({ productId: l.productId, qty: l.qty, unitPrice: l.unitPrice ?? null })),
+    });
+    const saleRef = db.collection('sales').doc(saleId);
+
+    const refs = [saleRef, settingsRef, counterRef('sales'), ...ids.map(productRef)];
+    if (clientId) refs.push(clientRef(clientId));
+    const snaps = await tx.getAll(...refs); // all reads first
+    const [saleSnap, settingsSnap, counterSnap] = snaps;
+    const productSnaps = snaps.slice(3, 3 + ids.length);
+    const clientSnap = clientId ? snaps[3 + ids.length] : null;
+
+    if (saleSnap.exists) {
+      if (saleSnap.get('fingerprint') !== fp) throw new SalesError('idempotency_conflict', 409);
+      return { result: saleSummary(saleSnap, true), duplicate: true, commit: () => {} };
+    }
+
+    const allowNegative = settingsSnap.exists && settingsSnap.get('allowNegativeStock') === true;
+    const prefix = (settingsSnap.exists && settingsSnap.get('invoicePrefix')) || 'TY';
+
+    const priced = lines.map((l, i) => {
+      const p = productSnaps[i];
+      if (!p.exists) throw new SalesError('product_not_found', 404);
+      if (p.get('isActive') === false) throw new SalesError('product_inactive', 409);
+      const stock = int(p.get('stockQty'));
+      if (!allowNegative && stock < l.qty) throw new SalesError('insufficient_stock', 409);
+      return {
+        productId: p.id,
+        name: p.get('name') ?? '',
+        qty: l.qty,
+        unitPrice: l.unitPrice ?? int(p.get('sellingPrice')),
+        unitCost: int(p.get('avgCost')), // snapshot: profit stays correct when costs change later
+        stockBefore: stock,
+        categoryId: p.get('categoryId') ?? null,
+      };
+    });
+    const { lineTotals, subtotal, total, credit } = computeTotals(priced, discount, cashPaid);
+
+    if (clientId) {
+      if (!clientSnap.exists) throw new SalesError('client_not_found', 404);
+      if (clientSnap.get('isArchived') === true) throw new SalesError('client_archived', 409);
+    } else if (credit > 0) {
+      throw new SalesError('client_required', 400);
+    }
+
+    const seq = int(counterSnap.get('value')) + 1;
+    const cogs = priced.reduce((a, l) => a + l.qty * l.unitCost, 0);
+
+    const result = { id: saleId, number: formatNumber(prefix, seq), total, remaining: credit, status: 'active', duplicate: false };
+    const commit = () => {
+      // ----- writes -----
+      tx.create(saleRef, {
+        number: formatNumber(prefix, seq),
+        fingerprint: fp,
+        clientId,
+        clientName: clientId ? clientSnap.get('name') ?? '' : '',
+        subtotal, discount, total,
+        cashPaid, credit,
+        paidTotal: cashPaid, remaining: credit, isOpen: credit > 0,
+        cogs, lineCount: priced.length,
+        status: 'active',
+        note: note ?? '',
+        businessDate,
+        createdBy: uid,
+        createdAt: ts(),
+      });
+      priced.forEach((l, i) => {
+        const n = String(i + 1).padStart(3, '0');
+        tx.create(saleRef.collection('sale_items').doc(n), {
+          productId: l.productId, productName: l.name, categoryId: l.categoryId,
+          qty: l.qty, unitPrice: l.unitPrice, unitCost: l.unitCost, lineTotal: lineTotals[i],
+        });
+        const mid = `sale_${saleId}_${n}`;
+        tx.create(db.collection('stock_movements').doc(mid), {
+          productId: l.productId, type: 'sale', reason: 'sale', saleId,
+          delta: -l.qty, qtyBefore: l.stockBefore, qtyAfter: l.stockBefore - l.qty,
+          avgCostBefore: l.unitCost, avgCostAfter: l.unitCost,
+          businessDate, createdBy: uid, createdAt: ts(),
+        });
+        tx.update(productRef(l.productId), { stockQty: l.stockBefore - l.qty, lastMovementId: mid });
+      });
+      if (clientId) tx.update(clientRef(clientId), { balance: inc(credit), totalPurchases: inc(total) });
+      tx.set(counterRef('sales'), { value: seq });
+      tx.set(statsRef(businessDate), {
+        businessDate,
+        salesCount: inc(1), salesTotal: inc(total), discountTotal: inc(discount),
+        cashSales: inc(cashPaid), creditSales: inc(credit), cogs: inc(cogs),
+        updatedAt: ts(),
+      }, { merge: true });
+
+      return result;
+    };
+    return { result, duplicate: false, commit, productIds: ids };
+  }
+
   return {
     /** input: {saleId, clientId?, businessDate, lines:[{productId, qty, unitPrice?}], discount, cashPaid, note} */
+    planSale,
     async createSale(uid, input) {
-      const { saleId, businessDate, lines, discount, cashPaid, note } = input;
-      const clientId = input.clientId ?? null;
-      assertBusinessDate(businessDate, now());
-      if (lines.length < 1 || lines.length > MAX_LINES) throw new SalesError('invalid_request', 400);
-      const ids = lines.map((l) => l.productId);
-      if (new Set(ids).size !== ids.length) throw new SalesError('duplicate_product', 400);
-      const fp = fingerprint({
-        clientId, businessDate, discount, cashPaid, note,
-        lines: lines.map((l) => ({ productId: l.productId, qty: l.qty, unitPrice: l.unitPrice ?? null })),
+      const out = await db.runTransaction(async (tx) => {
+        const plan = await planSale(tx, uid, input);
+        plan.commit();
+        return plan;
       });
-      const saleRef = db.collection('sales').doc(saleId);
-
-      return db.runTransaction(async (tx) => {
-        const refs = [saleRef, settingsRef, counterRef('sales'), ...ids.map(productRef)];
-        if (clientId) refs.push(clientRef(clientId));
-        const snaps = await tx.getAll(...refs); // all reads first
-        const [saleSnap, settingsSnap, counterSnap] = snaps;
-        const productSnaps = snaps.slice(3, 3 + ids.length);
-        const clientSnap = clientId ? snaps[3 + ids.length] : null;
-
-        if (saleSnap.exists) {
-          if (saleSnap.get('fingerprint') !== fp) throw new SalesError('idempotency_conflict', 409);
-          return saleSummary(saleSnap, true);
-        }
-
-        const allowNegative = settingsSnap.exists && settingsSnap.get('allowNegativeStock') === true;
-        const prefix = (settingsSnap.exists && settingsSnap.get('invoicePrefix')) || 'TY';
-
-        const priced = lines.map((l, i) => {
-          const p = productSnaps[i];
-          if (!p.exists) throw new SalesError('product_not_found', 404);
-          if (p.get('isActive') === false) throw new SalesError('product_inactive', 409);
-          const stock = int(p.get('stockQty'));
-          if (!allowNegative && stock < l.qty) throw new SalesError('insufficient_stock', 409);
-          return {
-            productId: p.id,
-            name: p.get('name') ?? '',
-            qty: l.qty,
-            unitPrice: l.unitPrice ?? int(p.get('sellingPrice')),
-            unitCost: int(p.get('avgCost')), // snapshot: profit stays correct when costs change later
-            stockBefore: stock,
-            categoryId: p.get('categoryId') ?? null,
-          };
-        });
-        const { lineTotals, subtotal, total, credit } = computeTotals(priced, discount, cashPaid);
-
-        if (clientId) {
-          if (!clientSnap.exists) throw new SalesError('client_not_found', 404);
-          if (clientSnap.get('isArchived') === true) throw new SalesError('client_archived', 409);
-        } else if (credit > 0) {
-          throw new SalesError('client_required', 400);
-        }
-
-        const seq = int(counterSnap.get('value')) + 1;
-        const cogs = priced.reduce((a, l) => a + l.qty * l.unitCost, 0);
-
-        // ----- writes -----
-        tx.create(saleRef, {
-          number: formatNumber(prefix, seq),
-          fingerprint: fp,
-          clientId,
-          clientName: clientId ? clientSnap.get('name') ?? '' : '',
-          subtotal, discount, total,
-          cashPaid, credit,
-          paidTotal: cashPaid, remaining: credit, isOpen: credit > 0,
-          cogs, lineCount: priced.length,
-          status: 'active',
-          note: note ?? '',
-          businessDate,
-          createdBy: uid,
-          createdAt: ts(),
-        });
-        priced.forEach((l, i) => {
-          const n = String(i + 1).padStart(3, '0');
-          tx.create(saleRef.collection('sale_items').doc(n), {
-            productId: l.productId, productName: l.name, categoryId: l.categoryId,
-            qty: l.qty, unitPrice: l.unitPrice, unitCost: l.unitCost, lineTotal: lineTotals[i],
-          });
-          const mid = `sale_${saleId}_${n}`;
-          tx.create(db.collection('stock_movements').doc(mid), {
-            productId: l.productId, type: 'sale', reason: 'sale', saleId,
-            delta: -l.qty, qtyBefore: l.stockBefore, qtyAfter: l.stockBefore - l.qty,
-            avgCostBefore: l.unitCost, avgCostAfter: l.unitCost,
-            businessDate, createdBy: uid, createdAt: ts(),
-          });
-          tx.update(productRef(l.productId), { stockQty: l.stockBefore - l.qty, lastMovementId: mid });
-        });
-        if (clientId) tx.update(clientRef(clientId), { balance: inc(credit), totalPurchases: inc(total) });
-        tx.set(counterRef('sales'), { value: seq });
-        tx.set(statsRef(businessDate), {
-          businessDate,
-          salesCount: inc(1), salesTotal: inc(total), discountTotal: inc(discount),
-          cashSales: inc(cashPaid), creditSales: inc(credit), cogs: inc(cogs),
-          updatedAt: ts(),
-        }, { merge: true });
-
-        return { id: saleId, number: formatNumber(prefix, seq), total, remaining: credit, status: 'active', duplicate: false };
-      });
+      if (!out.duplicate) await stockChanged(out.productIds);
+      return out.result;
     },
 
     /**
@@ -145,7 +169,8 @@ export function createSalesService({ db, fieldValue, now = () => Date.now() }) {
       const saleRef = db.collection('sales').doc(saleId);
       const voidRef = db.collection('sale_voids').doc(saleId);
 
-      return db.runTransaction(async (tx) => {
+      let touched = [];
+      const out = await db.runTransaction(async (tx) => {
         const [saleSnap, voidSnap] = await tx.getAll(saleRef, voidRef);
         if (!saleSnap.exists) throw new SalesError('sale_not_found', 404);
         if (voidSnap.exists || saleSnap.get('status') === 'voided') {
@@ -153,6 +178,7 @@ export function createSalesService({ db, fieldValue, now = () => Date.now() }) {
         }
         const itemsSnap = await tx.get(saleRef.collection('sale_items'));
         const items = itemsSnap.docs.map((d) => ({ n: d.id, ...d.data() }));
+        touched = items.map((it) => it.productId);
         const clientId = saleSnap.get('clientId');
         const refs = items.map((it) => productRef(it.productId));
         if (clientId) refs.push(clientRef(clientId));
@@ -200,6 +226,8 @@ export function createSalesService({ db, fieldValue, now = () => Date.now() }) {
 
         return { id: saleId, status: 'voided', duplicate: false };
       });
+      if (!out.duplicate) await stockChanged(touched);
+      return out;
     },
 
     /** Customer payment settles the client's oldest open sales first (FIFO). */
