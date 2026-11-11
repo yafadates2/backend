@@ -21,7 +21,9 @@ export function defaultLaunch(env = process.env) {
       executablePath: env.PUPPETEER_EXECUTABLE_PATH || undefined,
       args: [
         '--disable-gpu', '--disable-dev-shm-usage',
-        ...(env.PDF_NO_SANDBOX === '1' ? ['--no-sandbox', '--disable-setuid-sandbox'] : []), // containers running as root
+        // Hosting containers (Render sets RENDER=true) run as root without user namespaces, where Chromium's sandbox
+        // cannot start. Safe here: the page runs no scripts (CSP) and every non-data: request is aborted.
+        ...(env.PDF_NO_SANDBOX === '1' || env.RENDER === 'true' ? ['--no-sandbox', '--disable-setuid-sandbox'] : []),
       ],
     });
   };
