@@ -14,6 +14,7 @@ import { createPdfService } from './pdf/service.js';
 import { getMessaging } from 'firebase-admin/messaging';
 import { createOrdersService } from './orders.js';
 import { createNotifier } from './notifications.js';
+import { startDailyReminders } from './reminders.js';
 import { createApp } from './app.js';
 
 const logger = pino();
@@ -48,6 +49,9 @@ const app = createApp({
   logger,
 });
 const server = app.listen(cfg.PORT, () => logger.info(`API listening on :${cfg.PORT}`));
+// 08:00 Africa/Tunis every day: "customer order expected today" pushes. Catches up right at start when the backend
+// (re)starts after 08:00; every order is reminded once per expected date, so a restart can never repeat a push.
+const reminders = startDailyReminders({ run: () => orders.sendDueReminders(), logger });
 for (const sig of ['SIGINT', 'SIGTERM']) {
-  process.on(sig, () => { server.close(); renderer.close().finally(() => process.exit(0)); }); // don't orphan Chromium
+  process.on(sig, () => { reminders.stop(); server.close(); renderer.close().finally(() => process.exit(0)); }); // don't orphan Chromium
 }

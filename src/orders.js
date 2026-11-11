@@ -1,5 +1,6 @@
 import { SalesError, MAX_LINES, assertBusinessDate, fingerprint, formatNumber } from './salesMath.js';
 import { evaluateAvailability, watchedIds, isOpen, isRealDate } from './ordersMath.js';
+import { businessDateAt } from './reminders.js';
 
 /**
  * Customer orders: requests the shop admin records for customers who have no account.
@@ -13,7 +14,11 @@ import { evaluateAvailability, watchedIds, isOpen, isRealDate } from './ordersMa
  *    order document; only the transaction that performs it asks for a push).
  *  - `customer_orders` is written ONLY here (Admin SDK); rules keep it read-only for apps.
  *
- * `sales` is the sales service (needs `planSale`); `notifier` sends the push (`orderAvailable(order)`).
+ *  - The "expected today" reminder is sent at most once per order and expected date: the order document records the
+ *    date it was reminded for (`expectedReminderFor`), claimed in a transaction BEFORE the push goes out.
+ *
+ * `sales` is the sales service (needs `planSale`); `notifier` sends the pushes (`orderAvailable(order)`,
+ * `orderExpectedToday(order)`).
  */
 export function createOrdersService({ db, fieldValue, sales, notifier, logger, now = () => Date.now() }) {
   const orders = () => db.collection('customer_orders');
@@ -105,6 +110,37 @@ export function createOrdersService({ db, fieldValue, sales, notifier, logger, n
     return { checked: ids.length, becameAvailable, backToPending };
   }
 
+  /**
+   * Claims today's reminder for ONE order: in a transaction, checks it is still open, still expected `date`, and not
+   * reminded for `date` yet, then records `expectedReminderFor = date`. Only the caller that wins gets the order
+   * back (racing jobs / instances / restarts get null), so each order is reminded once per expected date.
+   * Closed orders (completed / cancelled) are never claimed. Changing the expected date later makes a new date
+   * eligible; changing it back to a date already reminded does not repeat the push.
+   */
+  async function claimReminder(orderId, date) {
+    return db.runTransaction(async (tx) => {
+      const snap = await tx.get(orderRef(orderId));
+      if (!snap.exists) return null;
+      if (!isOpen(snap.get('status')) || snap.get('expectedDate') !== date) return null;
+      if (snap.get('expectedReminderFor') === date) return null;
+      tx.update(orderRef(orderId), { expectedReminderFor: date, expectedReminderAt: ts() });
+      return {
+        id: orderId, number: snap.get('number'), customerName: snap.get('customerName'), expectedDate: date,
+        lines: (snap.get('lines') ?? []).map((l) => ({ productName: l.productName, qty: l.qty })),
+      };
+    });
+  }
+
+  /** Nobody could be reached (no device, or the push service was down): give the claim back so a later run retries. */
+  async function releaseReminder(orderId, date) {
+    await db.runTransaction(async (tx) => {
+      const snap = await tx.get(orderRef(orderId));
+      if (snap.exists && snap.get('expectedReminderFor') === date) {
+        tx.update(orderRef(orderId), { expectedReminderFor: null, expectedReminderAt: null });
+      }
+    });
+  }
+
   /** Orders still pending/available that contain any of these products. */
   async function watchingOrderIds(productIds) {
     const unique = [...new Set(productIds)];
@@ -140,6 +176,34 @@ export function createOrdersService({ db, fieldValue, sales, notifier, logger, n
         snap.docs.forEach((d) => ids.add(d.id));
       }
       return reevaluateMany([...ids]);
+    },
+
+    /**
+     * Morning reminder: one push for every OPEN order (pending, available or notified; never completed or cancelled)
+     * whose expected date is today in the shop's time zone, regardless of its stock. Safe to run any number of times
+     * a day (see claimReminder). Returns { date, due, sent, skipped, undelivered }:
+     * `skipped` = already reminded / no longer eligible, `undelivered` = claim released for a retry.
+     */
+    async sendDueReminders() {
+      const date = businessDateAt(now());
+      const snap = await orders().where('expectedDate', '==', date).get();
+      let sent = 0; let skipped = 0; let undelivered = 0;
+      for (const d of snap.docs) {
+        let claimed = null;
+        try {
+          claimed = await claimReminder(d.id, date);
+          if (!claimed) { skipped += 1; continue; }
+          const res = await notifier?.orderExpectedToday(claimed);
+          if ((res?.sent ?? 0) > 0) { sent += 1; continue; }
+          throw new Error('no device reached');
+        } catch (err) {
+          if (!claimed) { logger?.error({ err, orderId: d.id }, 'reminder claim failed'); undelivered += 1; continue; }
+          undelivered += 1;
+          logger?.warn({ err, orderId: d.id }, 'reminder not delivered; will retry');
+          await releaseReminder(d.id, date).catch((e) => logger?.error({ err: e, orderId: d.id }, 'reminder release failed'));
+        }
+      }
+      return { date, due: snap.docs.length, sent, skipped, undelivered };
     },
 
     /** input: {orderId, customerName, customerPhone, lines:[{productId, qty, unitPrice?}], expectedDate|null, notes} */
